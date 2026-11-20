@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Voice Test</title>
+<style>
+:root{--bg:#faf8f4;--fg:#1d1d1f;--mut:#6b6b70;--card:#fff;--line:#e4e0d8;--acc:#2f5d8a;--accfg:#fff;--ok:#1f7a3f;--bad:#b3261e}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--fg:#ececf0;--mut:#9a9aa2;--card:#1f1f23;--line:#2e2e34;--acc:#7fb0e6;--accfg:#0b1622;--ok:#6fd08c;--bad:#ff8a80}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:max(14px,env(safe-area-inset-top)) 14px 60px}
+main{max-width:720px;margin:0 auto}
+h1{font:700 26px Georgia,serif;margin:6px 0}
+h2{font-size:18px;margin:0 0 4px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}
+.muted{color:var(--mut)}.small{font-size:13px}
+button,select,textarea{font:inherit;color:inherit}
+button{border:1px solid var(--line);background:var(--bg);border-radius:10px;padding:10px 14px;font-weight:600;cursor:pointer}
+button.p{background:var(--acc);color:var(--accfg);border-color:var(--acc)}
+button:disabled{opacity:.5}
+select,textarea{width:100%;border:1px solid var(--line);background:var(--bg);border-radius:10px;padding:9px}
+textarea{min-height:110px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.bar{height:8px;border-radius:8px;background:var(--line);overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
+pre{white-space:pre-wrap;word-break:break-word;font:12px/1.4 ui-monospace,Menlo,monospace;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px;margin:8px 0 0;max-height:260px;overflow:auto}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+.tag{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;background:var(--line);margin-left:6px}
+</style>
+</head>
+<body>
+<main>
+<h1>Voice test</h1>
+<p class="muted">Compares free, offline AI voices on your phone. Nothing here uses a paid service. Load one engine at a time, starting from the top, and tap <b>Test voice</b>. Then press <b>Copy results</b> at the bottom and paste them to Claude.</p>
+
+<div class="card"><h2>This device</h2><pre id="dev">checking…</pre></div>
+
+<div class="card"><h2>Text to speak</h2>
+<textarea id="text">The village lay quiet beneath a pale November sky. Nobody had expected the letter to arrive so soon, and nobody wanted to be the one to open it. In the end, it was Margaret who broke the seal, read it twice, and began, very slowly, to smile.</textarea></div>
+
+<div id="engines"></div>
+
+<div class="card"><h2>Lock-screen test</h2>
+<p class="muted small">Tests whether speech keeps going with the screen locked. Pick a loaded engine, tap Start, then <b>immediately press the side button to lock the phone</b>. Wait about 90 seconds, unlock, and read the log below.</p>
+<label class="small muted">Engine</label><select id="lockEngine"><option value="">(load an engine first)</option></select>
+<label class="small muted">How the sound is played</label>
+<select id="lockMode"><option value="webaudio">Web Audio (queue ahead)</option><option value="element">Audio element (one clip at a time)</option></select>
+<div class="row"><button class="p" id="lockStart">Start lock test</button><button id="lockStop">Stop</button></div>
+<pre id="lockLog">No test run yet.</pre></div>
+
+<div class="card"><h2>Results to send to Claude</h2>
+<div class="row"><button class="p" id="copyBtn">Copy results</button></div>
+<pre id="report">Nothing yet.</pre></div>
+</main>
+
+<script type="module">
+const $ = s => document.querySelector(s);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const fmtMB = b => (b / 1048576).toFixed(0) + ' MB';
+const results = {};            // engineId -> {...}
+const loaded = {};             // engineId -> engine instance
+let ctx = null;
+const t0 = performance.now();
+const secs = () => ((performance.now() - t0) / 1000).toFixed(1);
+
+function audioCtx() {
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state !== 'running') ctx.resume();
+  return ctx;
+}
+function concat(arrs) { let n = 0; for (const a of arrs) n += a.length; const o = new Float32Array(n); let p = 0; for (const a of arrs) { o.set(a, p); p += a.length; } return o; }
+function playSamples(samples, sr) {
+  const c = audioCtx(); const b = c.createBuffer(1, samples.length, sr); b.copyToChannel(samples, 0);
+  const s = c.createBufferSource(); s.buffer = b; s.connect(c.destination); s.start(); return s;
+}
+function wavBlob(samples, sr) {
+  const n = samples.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) { const x = Math.max(-1, Math.min(1, samples[i])); v.setInt16(44 + i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true); }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+function splitSentences(t) { return (t.replace(/\s+/g, ' ').trim().match(/[^.!?]+[.!?]+["”']*|[^.!?]+$/g) || [t]).map(s => s.trim()).filter(Boolean); }
+
+// ---------- Engines ----------
+const GB_KOKORO = ['bf_emma', 'bf_isabella', 'bf_alice', 'bf_lily', 'bm_george', 'bm_daniel', 'bm_lewis', 'bm_fable'];
+const OTHER_KOKORO = ['af_heart', 'af_bella', 'am_michael'];
+const kokoroVoices = [...GB_KOKORO, ...OTHER_KOKORO];
+
+async function loadKokoro(device, dtype, progress) {
+  const mod = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/dist/kokoro.web.js');
+  const files = {};
+  const tts = await mod.KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
+    dtype, device,
+    progress_callback: p => {
+      if (p.status === 'progress' && p.file) {
+        files[p.file] = { l: p.loaded, t: p.total };
+        let l = 0, t = 0; for (const f in files) { l += files[f].l; t += files[f].t; }
+        progress(t ? l / t : 0, fmtMB(l) + ' / ' + fmtMB(t));
+      }
+    }
+  });
+  return { async synth(text, voice) { const a = await tts.generate(text, { voice, speed: 1 }); return { samples: a.audio, sr: a.sampling_rate }; } };
+}
+
+const MP_VER = '1.2.3';
+const MP_FILE = 'kokoro_int8_gpu_fp16.litertlm';
+const MP_URL = 'https://huggingface.co/litert-community/Kokoro-82M/resolve/main/' + MP_FILE;
+async function loadMediaPipe(progress) {
+  const mod = await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@${MP_VER}/audio_bundle.mjs`);
+  const fileset = await mod.FilesetResolver.forAudioTasks(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@${MP_VER}/wasm`);
+  // Download the 295 MB model once into this browser's own storage (keeps the original file name, which MediaPipe needs)
+  const key = new URL('models/' + MP_FILE, location.href).href;
+  const cache = await caches.open('vt-models-v1');
+  let have = await cache.match(key);
+  if (!have) {
+    progress(0, 'downloading model…');
+    const resp = await fetch(MP_URL);
+    if (!resp.ok) throw new Error('Model download failed: HTTP ' + resp.status);
+    const total = +resp.headers.get('content-length') || 295e6; let got = 0;
+    const counted = resp.body.pipeThrough(new TransformStream({ transform(ch, c) { got += ch.length; progress(got / total, fmtMB(got) + ' / ' + fmtMB(total)); c.enqueue(ch); } }));
+    await cache.put(key, new Response(counted, { headers: { 'content-type': 'application/octet-stream', 'content-length': String(total) } }));
+  }
+  progress(1, 'starting engine (this can take a minute)…');
+  let tts;
+  try {
+    if (!navigator.serviceWorker || !navigator.serviceWorker.controller) throw new Error('page is not yet controlled by the service worker; reload once and try again');
+    tts = await mod.TextToSpeech.createFromOptions(fileset, { baseOptions: { modelAssetPath: 'models/' + MP_FILE, delegate: 'GPU' }, defaultVoiceId: 'bf_emma' });
+  } catch (e) {
+    throw new Error('MediaPipe could not start: ' + (e && e.message || e));
+  }
+  return { async synth(text, voice) { const r = await tts.synthesize(text, { voiceId: voice }); return { samples: r.samples, sr: r.sampleRateHz }; } };
+}
+
+async function loadPiper(progress) {
+  const tts = await import('https://cdn.jsdelivr.net/npm/@mintplex-labs/piper-tts-web@1.0.4/+esm');
+  return {
+    async prepare(voice) { try { const s = await tts.stored(); if (s.includes(voice)) return; } catch (e) { } await tts.download(voice, p => progress(p.total ? p.loaded / p.total : 0, fmtMB(p.loaded || 0) + ' / ' + fmtMB(p.total || 0))); },
+    async synth(text, voice) {
+      const wav = await tts.predict({ text, voiceId: voice });
+      const c = audioCtx(); const buf = await c.decodeAudioData(await wav.arrayBuffer());
+      return { samples: buf.getChannelData(0).slice(), sr: buf.sampleRate };
+    }
+  };
+}
+
+const ENGINES = [
+  { id: 'builtin', title: '0. iPhone built-in voice (for comparison)', size: 'nothing to download', voices: [], builtin: true },
+  { id: 'kokoro-wasm', title: '1. Kokoro, smaller version', size: '≈ 90 MB, one-time download', voices: kokoroVoices, load: p => loadKokoro('wasm', 'q8', p), note: 'Runs on the phone\'s processor. Most likely to work.' },
+  { id: 'kokoro-gpu', title: '2. Kokoro, graphics-chip version (WebGPU)', size: '≈ 325 MB, one-time download', voices: kokoroVoices, load: p => loadKokoro('webgpu', 'fp32', p), note: 'Faster if it works, but may crash the page. Try after 1.' },
+  { id: 'mediapipe', title: '3. Kokoro via Google MediaPipe', size: '≈ 295 MB, one-time download', voices: kokoroVoices, load: loadMediaPipe, note: 'The route you asked for. Needs iOS 26 WebGPU. May run out of memory.' },
+  { id: 'piper', title: '4. Piper (experimental)', size: '≈ 20–75 MB per voice', voices: ['en_GB-alba-medium', 'en_GB-cori-medium', 'en_GB-jenny_dioco-medium', 'en_GB-northern_english_male-medium', 'en_GB-alan-medium'], load: loadPiper, note: 'Lighter, usually less natural. This wrapper is untested, so an error here is useful information.' }
+];
+
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+
+function buildCards() {
+  const host = $('#engines'); host.innerHTML = '';
+  for (const e of ENGINES) {
+    const card = document.createElement('div'); card.className = 'card'; card.id = 'c-' + e.id;
+    card.innerHTML = `<h2>${esc(e.title)}</h2><div class="muted small">${esc(e.size)}${e.note ? ' · ' + esc(e.note) : ''}</div>
+      ${e.builtin ? '' : `<div class="row"><button class="p" data-a="load">Load engine</button></div><div class="bar"><i></i></div>`}
+      <div class="small muted" data-s="status">${e.builtin ? 'Ready.' : 'Not loaded.'}</div>
+      <div class="row"><select data-s="voice"></select></div>
+      <div class="row"><button class="p" data-a="test" ${e.builtin ? '' : 'disabled'}>Test voice</button><button data-a="stop">Stop</button></div>
+      <pre data-s="out" style="display:none"></pre>`;
+    host.appendChild(card);
+    const sel = card.querySelector('[data-s=voice]');
+    if (e.builtin) { fillBuiltin(sel); speechSynthesis.onvoiceschanged = () => fillBuiltin(sel); }
+    else for (const v of e.voices) sel.add(new Option(v + (v.startsWith('b') ? '  (British)' : ''), v));
+    card.addEventListener('click', ev => { const a = ev.target.dataset.a; if (a) action(e, card, a); });
+  }
+}
+function fillBuiltin(sel) {
+  const vs = speechSynthesis.getVoices().filter(v => /^en/i.test(v.lang)).sort((a, b) => (/GB/i.test(b.lang) - /GB/i.test(a.lang)) || a.name.localeCompare(b.name));
+  sel.innerHTML = ''; for (const v of vs) sel.add(new Option(`${v.name} (${v.lang})`, v.voiceURI));
+}
+
+let currentSource = null;
+async function action(e, card, a) {
+  const q = s => card.querySelector(`[data-s=${s}]`);
+  const status = q('status'), out = q('out'), bar = card.querySelector('.bar i');
+  const setProg = (f, label) => { if (bar) bar.style.width = Math.round(f * 100) + '%'; status.textContent = label || ''; };
+  if (a === 'stop') { try { speechSynthesis.cancel(); } catch (x) { } if (currentSource) try { currentSource.stop(); } catch (x) { } return; }
+  if (a === 'load') {
+    const btn = card.querySelector('[data-a=load]'); btn.disabled = true;
+    const start = performance.now(); status.textContent = 'Loading…'; status.className = 'small muted';
+    const r = results[e.id] = { title: e.title, load: 'running' };
+    try {
+      if (e.id === 'piper') {
+        loaded[e.id] = await e.load(setProg);
+        await loaded[e.id].prepare(q('voice').value);
+      } else loaded[e.id] = await e.load(setProg);
+      const secsLoad = ((performance.now() - start) / 1000).toFixed(1);
+      r.load = `ok in ${secsLoad}s`; status.textContent = `Loaded in ${secsLoad}s. Tap Test voice.`; status.className = 'small ok';
+      card.querySelector('[data-a=test]').disabled = false; setProg(1, status.textContent);
+      refreshLockEngines();
+    } catch (err) {
+      r.load = 'FAILED: ' + (err && err.message || err); status.textContent = r.load; status.className = 'small bad'; btn.disabled = false;
+    }
+    report(); return;
+  }
+  if (a === 'test') {
+    const text = $('#text').value.trim(); const voice = q('voice').value; out.style.display = 'block'; out.textContent = 'Working…';
+    if (e.builtin) {
+      speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); const v = speechSynthesis.getVoices().find(x => x.voiceURI === voice); if (v) { u.voice = v; u.lang = v.lang; }
+      speechSynthesis.speak(u); out.textContent = 'Speaking with the built-in voice.'; results[e.id] = { title: e.title, voice, note: 'built-in voice played' }; report(); return;
+    }
+    try {
+      const eng = loaded[e.id]; if (e.id === 'piper') await eng.prepare(voice);
+      const parts = splitSentences(text); const chunks = []; const times = []; let audioSec = 0; const t = performance.now();
+      for (const s of parts) {
+        const a0 = performance.now(); const r = await eng.synth(s, voice); const dt = (performance.now() - a0) / 1000;
+        const dur = r.samples.length / r.sr; audioSec += dur; times.push({ dt, dur }); chunks.push(r.samples); out.textContent = `Generated ${times.length}/${parts.length}…`; sr = r.sr;
+      }
+      const total = (performance.now() - t) / 1000;
+      const first = times[0]; const rtf = total / audioSec;
+      const msg = `voice ${voice}\nfirst sentence: ${first.dt.toFixed(1)}s to make ${first.dur.toFixed(1)}s of audio\nall ${parts.length} sentences: ${total.toFixed(1)}s to make ${audioSec.toFixed(1)}s of audio\nspeed ratio: ${rtf.toFixed(2)} (below 1.0 = faster than real time, good)`;
+      out.textContent = msg + '\nPlaying…'; results[e.id] = { ...(results[e.id] || { title: e.title }), voice, summary: msg.replace(/\n/g, ' | ') };
+      currentSource = playSamples(concat(chunks), sr); report();
+    } catch (err) { out.textContent = 'FAILED: ' + (err && err.message || err); results[e.id] = { ...(results[e.id] || { title: e.title }), test: 'FAILED: ' + (err && err.message || err) }; report(); }
+  }
+}
+let sr = 24000;
+
+// ---------- Lock-screen test ----------
+const LOCK_TEXT = 'This is the lock screen test. Please lock your phone now. The voice should keep reading while the screen is dark. If it stops, the log will tell us when. Here is another sentence to keep things going. And one more, so that the test lasts long enough to be meaningful. A gentle breeze moved across the quiet harbour. Boats rocked slowly at their moorings. Somewhere in the distance, a bell rang twice. The morning light grew steadily brighter. Nobody on the quay seemed to be in any hurry. The tide turned, and the day began in earnest. Thank you for waiting. The test is now almost finished. This is the final sentence.';
+let lockRun = 0, lockLines = [];
+function lg(m) { lockLines.push(`[${secs()}s] ${m}`); $('#lockLog').textContent = lockLines.join('\n'); report(); }
+document.addEventListener('visibilitychange', () => { if (lockRun) lg('page ' + document.visibilityState); });
+function refreshLockEngines() {
+  const sel = $('#lockEngine'); const cur = sel.value; sel.innerHTML = '';
+  for (const e of ENGINES) if (loaded[e.id] && !e.builtin) sel.add(new Option(e.title, e.id));
+  if (!sel.options.length) sel.add(new Option('(load an engine first)', '')); else if (cur) sel.value = cur;
+}
+$('#lockStop').onclick = () => { lockRun++; lg('stopped'); };
+$('#lockStart').onclick = async () => {
+  const id = $('#lockEngine').value; if (!id) { $('#lockLog').textContent = 'Load an engine first.'; return; }
+  const eng = loaded[id]; const mode = $('#lockMode').value; const voice = document.querySelector(`#c-${id} [data-s=voice]`).value;
+  const run = ++lockRun; lockLines = []; lg(`start: ${id}, mode ${mode}. Lock the phone now.`);
+  const sents = splitSentences(LOCK_TEXT); const c = audioCtx(); let nextStart = c.currentTime + 0.2; let prefetch = null;
+  const gen = async i => { const t = performance.now(); const r = await eng.synth(sents[i], voice); lg(`made sentence ${i + 1} in ${((performance.now() - t) / 1000).toFixed(1)}s`); return r; };
+  try {
+    prefetch = gen(0);
+    for (let i = 0; i < sents.length; i++) {
+      if (run !== lockRun) return;
+      const r = await prefetch; if (i + 1 < sents.length) prefetch = gen(i + 1);
+      const dur = r.samples.length / r.sr;
+      if (mode === 'webaudio') {
+        const b = c.createBuffer(1, r.samples.length, r.sr); b.copyToChannel(r.samples, 0);
+        const s = c.createBufferSource(); s.buffer = b; s.connect(c.destination);
+        const at = Math.max(nextStart, c.currentTime + 0.05); s.start(at); nextStart = at + dur; const n = i + 1; s.onended = () => lg(`finished playing sentence ${n}`);
+        lg(`queued sentence ${i + 1} (audio state: ${c.state})`);
+        while (nextStart - c.currentTime > 12 && run === lockRun) await sleep(500);
+      } else {
+        const a = new Audio(URL.createObjectURL(wavBlob(r.samples, r.sr))); const n = i + 1;
+        await new Promise(res => { let done = false; const fin = why => { if (!done) { done = true; lg(`sentence ${n} ${why}`); res(); } }; a.onended = () => fin('ended'); a.onerror = () => fin('error'); a.play().then(() => lg(`playing sentence ${n}`)).catch(err => fin('could not play: ' + err.message)); setTimeout(() => fin('timeout (no end event)'), (dur + 4) * 1000); });
+      }
+    }
+    lg('all sentences handed over');
+  } catch (err) { lg('FAILED: ' + (err && err.message || err)); }
+};
+
+// ---------- Device + report ----------
+async function deviceInfo() {
+  let est = {}; try { est = await navigator.storage.estimate(); } catch (e) { }
+  const lines = [
+    'Browser: ' + navigator.userAgent.replace(/Mozilla\/5.0 /, '').slice(0, 120),
+    'WebGPU available: ' + (navigator.gpu ? 'yes' : 'no'),
+    'Opened from Home Screen: ' + ((navigator.standalone || matchMedia('(display-mode: standalone)').matches) ? 'yes' : 'no (normal Safari tab)'),
+    'Online: ' + navigator.onLine,
+    'Service worker active: ' + !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+    'Cross-origin isolated (multi-thread WASM): ' + (self.crossOriginIsolated ? 'yes' : 'no'),
+    'CPU cores reported: ' + (navigator.hardwareConcurrency || '?'),
+    'Storage used / allowed: ' + (est.usage != null ? fmtMB(est.usage) + ' / ' + fmtMB(est.quota) : 'unknown')
+  ];
+  window.__dev = lines.join('\n'); $('#dev').textContent = window.__dev;
+}
+function report() {
+  let t = 'VOICE TEST RESULTS\n' + (window.__dev || '') + '\n';
+  for (const e of ENGINES) { const r = results[e.id]; if (!r) continue; t += `\n## ${r.title}\nload: ${r.load || '-'}\n${r.voice ? 'voice: ' + r.voice + '\n' : ''}${r.summary || r.test || r.note || ''}\n`; }
+  if (lockLines.length) t += '\n## Lock-screen log\n' + lockLines.join('\n') + '\n';
+  $('#report').textContent = t;
+}
+$('#copyBtn').onclick = async () => {
+  const t = $('#report').textContent;
+  try { await navigator.clipboard.writeText(t); $('#copyBtn').textContent = 'Copied ✓'; }
+  catch (e) { const r = document.createRange(); r.selectNodeContents($('#report')); const s = getSelection(); s.removeAllRanges(); s.addRange(r); $('#copyBtn').textContent = 'Text selected: tap Copy in the menu'; }
+};
+
+buildCards(); deviceInfo(); setInterval(deviceInfo, 5000);
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').then(() => deviceInfo()).catch(() => { });
+</script>
+</body>
+</html>
